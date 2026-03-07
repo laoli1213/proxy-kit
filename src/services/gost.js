@@ -4,6 +4,7 @@ const { exec } = require("child_process");
 const { verifyPort } = require("./verify");
 
 const PID_DIR = "/var/run/gost-slots";
+const LOG_DIR = "/tmp/gost-slots";
 
 function run(cmd) {
     return new Promise((resolve, reject) => {
@@ -38,8 +39,13 @@ function pidFileOf(port) {
     return path.join(PID_DIR, `gost-${port}.pid`);
 }
 
-async function ensurePidDir() {
+function logFileOf(port) {
+    return path.join(LOG_DIR, `gost-${port}.log`);
+}
+
+async function ensureDirs() {
     await fs.mkdir(PID_DIR, { recursive: true });
+    await fs.mkdir(LOG_DIR, { recursive: true });
 }
 
 async function stopPort(port) {
@@ -55,11 +61,13 @@ async function stopPort(port) {
         // ignore missing pid file
     }
 
-    await run(`pkill -f ${shellQuote(`127.0.0.1:${port}`)} 2>/dev/null || true`);
+    await run(`pkill -f ${shellQuote(`gost.*127.0.0.1:${port}`)} 2>/dev/null || true`);
     await run(`rm -f ${shellQuote(pidFile)}`);
 }
 
-async function startPort(port, proxy) {
+function buildUpstream(proxy) {
+    if (!proxy) return null;
+
     const protocol = escapeConfigValue(proxy.protocol || "socks5");
     const host = escapeConfigValue(proxy.host || "");
     const upstreamPort = Number(proxy.port);
@@ -70,31 +78,41 @@ async function startPort(port, proxy) {
         throw new Error("invalid proxy config");
     }
 
-    const pidFile = pidFileOf(port);
-
     const authPart =
         username || password
             ? `${username}:${password}@`
             : "";
 
-    const upstream = `${protocol}://${authPart}${host}:${upstreamPort}`;
+    return `${protocol}://${authPart}${host}:${upstreamPort}`;
+}
 
-    const cmd = [
+async function startPort(port, proxy) {
+    const pidFile = pidFileOf(port);
+    const logFile = logFileOf(port);
+    const upstream = buildUpstream(proxy);
+
+    const parts = [
+        "export GOST_LOGGER_LEVEL=error;",
         "nohup gost",
-        `-L ${shellQuote(`socks5://127.0.0.1:${port}`)}`,
-        `-F ${shellQuote(upstream)}`,
-        `>/dev/null 2>&1 & echo $! > ${shellQuote(pidFile)}`
-    ].join(" ");
+        `-L ${shellQuote(`socks5://127.0.0.1:${port}`)}`
+    ];
 
+    if (upstream) {
+        parts.push(`-F ${shellQuote(upstream)}`);
+    }
+
+    parts.push(`>${shellQuote(logFile)} 2>&1 & echo $! > ${shellQuote(pidFile)}`);
+
+    const cmd = parts.join(" ");
     await run(cmd);
 }
 
 async function switchPort(port, proxy) {
     ensurePort(port);
-    await ensurePidDir();
+    await ensureDirs();
 
     await stopPort(port);
-    await startPort(port, proxy);
+    await startPort(port, proxy || null);
 
     await new Promise((r) => setTimeout(r, 1500));
 
@@ -102,14 +120,17 @@ async function switchPort(port, proxy) {
 
     return {
         port,
+        mode: proxy ? "proxy" : "direct",
         ip,
-        upstream: {
-            protocol: proxy.protocol || "socks5",
-            host: proxy.host,
-            port: proxy.port,
-            username: proxy.username || ""
-        }
+        upstream: proxy
+            ? {
+                protocol: proxy.protocol || "socks5",
+                host: proxy.host,
+                port: proxy.port,
+                username: proxy.username || ""
+            }
+            : null
     };
 }
 
-module.exports = { switchPort };
+module.exports = { switchPort, stopPort, startPort };

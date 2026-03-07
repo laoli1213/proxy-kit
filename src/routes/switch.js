@@ -13,18 +13,33 @@ router.post("/", async (req, res) => {
 
         const slotNum = Number(slot);
 
-        if (Number.isNaN(slotNum)) {
-            return res.status(400).json({ ok: false, error: "slot must be a number" });
+        if (!Number.isInteger(slotNum)) {
+            return res.status(400).json({ ok: false, error: "slot must be an integer" });
         }
 
-        if (!proxy || !proxy.host || !proxy.port) {
-            return res.status(400).json({ ok: false, error: "proxy.host and proxy.port are required" });
+        if (slotNum < 1 || slotNum > 30) {
+            return res.status(400).json({ ok: false, error: "slot out of range" });
+        }
+
+        if (proxy != null) {
+            if (!proxy.host || !proxy.port) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "proxy.host and proxy.port are required when proxy is provided"
+                });
+            }
         }
 
         const port = 20000 + slotNum;
+        const result = await switchPort(port, proxy || null);
 
-        const result = await switchPort(port, proxy);
-        res.json({ ok: true, result, slot: slotNum, port });
+        res.json({
+            ok: true,
+            action: proxy ? "set-proxy" : "set-direct",
+            result,
+            slot: slotNum,
+            port
+        });
     } catch (err) {
         res.status(500).json({
             ok: false,
