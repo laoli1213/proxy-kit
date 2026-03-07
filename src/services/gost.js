@@ -1,22 +1,26 @@
+const fs = require("fs").promises;
+const path = require("path");
 const { exec } = require("child_process");
 const { verifyPort } = require("./verify");
+
+const PID_DIR = "/var/run/gost-slots";
 
 function run(cmd) {
     return new Promise((resolve, reject) => {
         exec(cmd, (error, stdout, stderr) => {
             if (error) {
-                return reject(new Error(stderr || error.message));
+                return reject(new Error((stderr || error.message).trim()));
             }
-            resolve(stdout.trim());
+            resolve((stdout || "").trim());
         });
     });
 }
 
-function escapeShell(value) {
-    return String(value).replace(/"/g, '\\"');
+function shellQuote(value) {
+    return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-async function switchPort(port, proxy) {
+function ensurePort(port) {
     if (!Number.isInteger(port)) {
         throw new Error("port must be an integer");
     }
@@ -24,32 +28,74 @@ async function switchPort(port, proxy) {
     if (port < 20001 || port > 20030) {
         throw new Error("port out of allowed range");
     }
+}
 
-    const protocol = proxy.protocol || "socks5";
-    const host = proxy.host;
-    const upstreamPort = proxy.port;
-    const username = proxy.username || "";
-    const password = proxy.password || "";
+function escapeConfigValue(value) {
+    return String(value).replace(/\n/g, "").trim();
+}
 
-    if (!host || !upstreamPort) {
+function pidFileOf(port) {
+    return path.join(PID_DIR, `gost-${port}.pid`);
+}
+
+async function ensurePidDir() {
+    await fs.mkdir(PID_DIR, { recursive: true });
+}
+
+async function stopPort(port) {
+    const pidFile = pidFileOf(port);
+
+    try {
+        const pid = (await fs.readFile(pidFile, "utf8")).trim();
+        if (pid) {
+            await run(`kill ${shellQuote(pid)} 2>/dev/null || true`);
+            await run(`sleep 1`);
+        }
+    } catch (_) {
+        // ignore missing pid file
+    }
+
+    await run(`pkill -f ${shellQuote(`127.0.0.1:${port}`)} 2>/dev/null || true`);
+    await run(`rm -f ${shellQuote(pidFile)}`);
+}
+
+async function startPort(port, proxy) {
+    const protocol = escapeConfigValue(proxy.protocol || "socks5");
+    const host = escapeConfigValue(proxy.host || "");
+    const upstreamPort = Number(proxy.port);
+    const username = escapeConfigValue(proxy.username || "");
+    const password = escapeConfigValue(proxy.password || "");
+
+    if (!host || !Number.isInteger(upstreamPort) || upstreamPort <= 0) {
         throw new Error("invalid proxy config");
     }
 
+    const pidFile = pidFileOf(port);
+
     const authPart =
         username || password
-            ? `${escapeShell(username)}:${escapeShell(password)}@`
+            ? `${username}:${password}@`
             : "";
 
-    await run(`pkill -f '127.0.0.1:${port}' || true`);
+    const upstream = `${protocol}://${authPart}${host}:${upstreamPort}`;
 
-    const startCmd = [
+    const cmd = [
         "nohup gost",
-        `-L "socks5://127.0.0.1:${port}"`,
-        `-F "${escapeShell(protocol)}://${authPart}${escapeShell(host)}:${escapeShell(upstreamPort)}"`,
-        ">/dev/null 2>&1 &"
+        `-L ${shellQuote(`socks5://127.0.0.1:${port}`)}`,
+        `-F ${shellQuote(upstream)}`,
+        `>/dev/null 2>&1 & echo $! > ${shellQuote(pidFile)}`
     ].join(" ");
 
-    await run(startCmd);
+    await run(cmd);
+}
+
+async function switchPort(port, proxy) {
+    ensurePort(port);
+    await ensurePidDir();
+
+    await stopPort(port);
+    await startPort(port, proxy);
+
     await new Promise((r) => setTimeout(r, 1500));
 
     const ip = await verifyPort(port);
@@ -58,10 +104,10 @@ async function switchPort(port, proxy) {
         port,
         ip,
         upstream: {
-            protocol,
-            host,
-            port: upstreamPort,
-            username
+            protocol: proxy.protocol || "socks5",
+            host: proxy.host,
+            port: proxy.port,
+            username: proxy.username || ""
         }
     };
 }
