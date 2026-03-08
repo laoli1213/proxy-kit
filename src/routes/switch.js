@@ -14,52 +14,30 @@ router.post("/", async (req, res) => {
     try {
         const { slot, proxy } = req.body || {};
 
-        console.log(`[switch][${requestId}] incoming request body=`, req.body || {});
-
         if (slot === undefined || slot === null || slot === "") {
-            console.warn(`[switch][${requestId}] rejected: slot is required`);
             return res.status(400).json({ ok: false, error: "slot is required", requestId });
         }
 
         const slotNum = Number(slot);
-        console.log(`[switch][${requestId}] parsed slot=${slotNum} rawSlot=${JSON.stringify(slot)}`);
 
         if (!Number.isInteger(slotNum)) {
-            console.warn(`[switch][${requestId}] rejected: slot must be an integer`);
             return res.status(400).json({ ok: false, error: "slot must be an integer", requestId });
         }
 
         if (proxy != null) {
-            console.log(`[switch][${requestId}] proxy summary=`, {
-                protocol: proxy.protocol || "socks5",
-                host: proxy.host,
-                port: proxy.port,
-                username: proxy.username || "",
-                hasPassword: Boolean(proxy.password),
-                timezone: proxy.timezone,
-                loc: proxy.loc,
-                altitude: proxy.altitude
-            });
-
             if (!proxy.host || !proxy.port) {
-                console.warn(`[switch][${requestId}] rejected: proxy.host and proxy.port are required`);
                 return res.status(400).json({
                     ok: false,
                     error: "proxy.host and proxy.port are required when proxy is provided",
                     requestId
                 });
             }
-        } else {
-            console.log(`[switch][${requestId}] proxy is null, switching to direct mode`);
         }
 
         const port = 20000 + slotNum;
-        console.log(`[switch][${requestId}] mapped slot=${slotNum} -> port=${port}`);
 
         const result = await switchPort(port, proxy || null, { requestId });
         const durationMs = Date.now() - startedAt;
-
-        console.log(`[switch][${requestId}] success in ${durationMs}ms result=`, result);
 
         res.json({
             ok: true,
@@ -72,7 +50,6 @@ router.post("/", async (req, res) => {
         });
     } catch (err) {
         const durationMs = Date.now() - startedAt;
-        console.error(`[switch][${requestId}] failed in ${durationMs}ms:`, err);
         res.status(500).json({
             ok: false,
             error: err.message || "switch failed",

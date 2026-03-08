@@ -22,29 +22,6 @@ function run(cmd, options = {}) {
     const { requestId, timeout } = options;
     const prefix = logPrefix(requestId);
 
-    console.log(`${prefix} exec: ${cmd}`);
-
-    return new Promise((resolve, reject) => {
-        exec(cmd, { timeout }, (error, stdout, stderr) => {
-            const stdoutText = summarizeText(stdout);
-            const stderrText = summarizeText(stderr);
-
-            if (stdoutText) {
-                console.log(`${prefix} stdout: ${stdoutText}`);
-            }
-            if (stderrText) {
-                console.warn(`${prefix} stderr: ${stderrText}`);
-            }
-
-            if (error) {
-                const message = stderrText || stdoutText || error.message;
-                console.error(`${prefix} exec failed: ${message}`);
-                return reject(new Error(message));
-            }
-
-            resolve((stdout || "").trim());
-        });
-    });
 }
 
 function shellQuote(value) {
@@ -173,7 +150,6 @@ async function removeState(port) {
 }
 
 async function ensureDirs(requestId) {
-    console.log(`${logPrefix(requestId)} ensuring dirs pidDir=${PID_DIR} logDir=${LOG_DIR}`);
     await fs.mkdir(PID_DIR, { recursive: true });
     await fs.mkdir(LOG_DIR, { recursive: true });
 }
@@ -186,12 +162,10 @@ async function readPidFromFile(port, options = {}) {
     try {
         const raw = (await fs.readFile(pidFile, "utf8")).trim();
         if (!/^\d+$/.test(raw)) {
-            console.warn(`${prefix} invalid pid file content port=${port} raw=${JSON.stringify(raw)}`);
             return null;
         }
         return Number(raw);
     } catch (err) {
-        console.log(`${prefix} no readable pid file for port=${port}: ${err.message}`);
         return null;
     }
 }
@@ -215,8 +189,6 @@ async function stopPort(port, options = {}) {
     const pidFile = pidFileOf(port);
     const handled = new Set();
 
-    console.log(`${prefix} stopping port=${port} pidFile=${pidFile}`);
-
     const pidFromFile = await readPidFromFile(port, { requestId });
     const candidatePids = [];
 
@@ -231,32 +203,25 @@ async function stopPort(port, options = {}) {
         }
     }
 
-    console.log(`${prefix} candidate pids for port=${port}: ${candidatePids.length ? candidatePids.join(",") : "<none>"}`);
-
     for (const pid of candidatePids) {
         if (handled.has(pid)) continue;
         handled.add(pid);
 
         if (!isProcessAlive(pid)) {
-            console.log(`${prefix} pid=${pid} already exited`);
             continue;
         }
 
         try {
             process.kill(pid, "SIGTERM");
-            console.log(`${prefix} sent SIGTERM pid=${pid}`);
         } catch (err) {
-            console.warn(`${prefix} SIGTERM failed pid=${pid}: ${err.message}`);
             continue;
         }
 
         const exited = await waitForExit(pid, 3000, 200);
         if (!exited && isProcessAlive(pid)) {
-            console.warn(`${prefix} pid=${pid} did not exit after SIGTERM, sending SIGKILL`);
             try {
                 process.kill(pid, "SIGKILL");
             } catch (err) {
-                console.warn(`${prefix} SIGKILL failed pid=${pid}: ${err.message}`);
             }
             await waitForExit(pid, 1500, 100);
         }
@@ -267,7 +232,6 @@ async function stopPort(port, options = {}) {
     }
 
     await fs.rm(pidFile, { force: true });
-    console.log(`${prefix} stop completed for port=${port}`);
 }
 
 function buildUpstream(proxy) {
@@ -307,8 +271,6 @@ async function startPort(port, proxy, options = {}) {
     parts.push(`>${shellQuote(logFile)} 2>&1 & echo $! > ${shellQuote(pidFile)}`);
 
     const cmd = parts.join(" ");
-    console.log(`${prefix} starting port=${port} mode=${normalizedProxy ? "proxy" : "direct"} logFile=${logFile}`);
-    console.log(`${prefix} desired upstream=`, maskProxy(normalizedProxy));
     await run(cmd, { requestId });
 
     await sleep(300);
@@ -321,7 +283,6 @@ async function startPort(port, proxy, options = {}) {
         throw new Error(`gost exited immediately after start pid=${pid} port=${port}`);
     }
 
-    console.log(`${prefix} started port=${port} pid=${pid}`);
     return pid;
 }
 
@@ -337,17 +298,7 @@ async function switchPort(port, proxy, options = {}) {
     const currentPid = await readPidFromFile(port, { requestId });
     const currentAlive = Boolean(currentPid && isProcessAlive(currentPid));
 
-    console.log(`${prefix} switchPort begin port=${port} desired=`, {
-        mode: desiredState.mode,
-        proxy: maskProxy(desiredState.proxy),
-    });
-    console.log(`${prefix} current state=`, currentState
-        ? { mode: currentState.mode, proxy: maskProxy(currentState.proxy), updatedAt: currentState.updatedAt }
-        : null);
-    console.log(`${prefix} current pid=${currentPid || "<none>"} alive=${currentAlive}`);
-
     if (sameState(currentState, desiredState) && currentAlive) {
-        console.log(`${prefix} desired state matches current state, reusing existing process`);
         return {
             port,
             mode: desiredState.mode,

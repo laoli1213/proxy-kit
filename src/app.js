@@ -17,5 +17,4 @@ app.get("/health", (req, res) => {
 app.use("/switch", switchRouter);
 
 app.listen(port, () => {
-    console.log(`proxy-switcher listening on ${port}`);
 });
