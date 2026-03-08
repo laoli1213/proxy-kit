@@ -5,6 +5,7 @@ const { verifyPort } = require("./verify");
 
 const PID_DIR = "/var/run/gost-slots";
 const LOG_DIR = "/tmp/gost-slots";
+const STATE_DIR = "/var/run/gost-slots";
 
 function logPrefix(requestId) {
     return requestId ? `[gost][${requestId}]` : `[gost]`;
@@ -73,72 +74,212 @@ function logFileOf(port) {
     return path.join(LOG_DIR, `gost-${port}.log`);
 }
 
+function stateFileOf(port) {
+    return path.join(STATE_DIR, `gost-${port}.json`);
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function waitForExit(pid, timeoutMs = 3000, intervalMs = 200) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (!isProcessAlive(pid)) {
+            return true;
+        }
+        await sleep(intervalMs);
+    }
+    return !isProcessAlive(pid);
+}
+
+function normalizeProxy(proxy) {
+    if (!proxy) return null;
+
+    const protocol = escapeConfigValue(proxy.protocol || "socks5");
+    const host = escapeConfigValue(proxy.host || "");
+    const port = Number(proxy.port);
+    const username = escapeConfigValue(proxy.username || "");
+    const password = escapeConfigValue(proxy.password || "");
+
+    if (!host || !Number.isInteger(port) || port <= 0) {
+        throw new Error("invalid proxy config");
+    }
+
+    return { protocol, host, port, username, password };
+}
+
+function getDesiredState(port, proxy) {
+    const normalizedProxy = normalizeProxy(proxy);
+    return {
+        port,
+        mode: normalizedProxy ? "proxy" : "direct",
+        proxy: normalizedProxy,
+    };
+}
+
+function maskProxy(proxy) {
+    if (!proxy) return null;
+    return {
+        protocol: proxy.protocol,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username,
+        hasPassword: Boolean(proxy.password),
+    };
+}
+
+function sameState(a, b) {
+    if (!a || !b) return false;
+    if (a.port !== b.port || a.mode !== b.mode) return false;
+    if (a.mode === "direct") return true;
+
+    return (
+        a.proxy?.protocol === b.proxy?.protocol &&
+        a.proxy?.host === b.proxy?.host &&
+        Number(a.proxy?.port) === Number(b.proxy?.port) &&
+        (a.proxy?.username || "") === (b.proxy?.username || "") &&
+        (a.proxy?.password || "") === (b.proxy?.password || "")
+    );
+}
+
+async function readState(port) {
+    try {
+        const raw = await fs.readFile(stateFileOf(port), "utf8");
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+async function writeState(port, state) {
+    const payload = {
+        ...state,
+        updatedAt: new Date().toISOString(),
+    };
+    await fs.writeFile(stateFileOf(port), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+async function removeState(port) {
+    await fs.rm(stateFileOf(port), { force: true });
+}
+
 async function ensureDirs(requestId) {
     console.log(`${logPrefix(requestId)} ensuring dirs pidDir=${PID_DIR} logDir=${LOG_DIR}`);
     await fs.mkdir(PID_DIR, { recursive: true });
     await fs.mkdir(LOG_DIR, { recursive: true });
 }
 
-async function stopPort(port, options = {}) {
+async function readPidFromFile(port, options = {}) {
     const { requestId } = options;
     const prefix = logPrefix(requestId);
     const pidFile = pidFileOf(port);
 
-    console.log(`${prefix} stopping port=${port} pidFile=${pidFile}`);
-
     try {
-        const pid = (await fs.readFile(pidFile, "utf8")).trim();
-        console.log(`${prefix} existing pid from file=${pid || "<empty>"}`);
-        if (pid) {
-            await run(`kill ${shellQuote(pid)} 2>/dev/null || true`, { requestId });
-            await run(`sleep 1`, { requestId });
+        const raw = (await fs.readFile(pidFile, "utf8")).trim();
+        if (!/^\d+$/.test(raw)) {
+            console.warn(`${prefix} invalid pid file content port=${port} raw=${JSON.stringify(raw)}`);
+            return null;
         }
+        return Number(raw);
     } catch (err) {
         console.log(`${prefix} no readable pid file for port=${port}: ${err.message}`);
+        return null;
+    }
+}
+
+async function findGostPidsByPort(port, options = {}) {
+    const output = await run(
+        `ps -eo pid=,args= | awk '/[g]ost/ && /127\\.0\\.0\\.1:${port}/ {print $1}'`,
+        { requestId: options.requestId }
+    ).catch(() => "");
+
+    return String(output || "")
+        .split(/\s+/)
+        .map((item) => item.trim())
+        .filter((item) => /^\d+$/.test(item))
+        .map(Number);
+}
+
+async function stopPort(port, options = {}) {
+    const { requestId } = options;
+    const prefix = logPrefix(requestId);
+    const pidFile = pidFileOf(port);
+    const handled = new Set();
+
+    console.log(`${prefix} stopping port=${port} pidFile=${pidFile}`);
+
+    const pidFromFile = await readPidFromFile(port, { requestId });
+    const candidatePids = [];
+
+    if (pidFromFile) {
+        candidatePids.push(pidFromFile);
     }
 
-    await run(`pkill -f ${shellQuote(`gost.*127.0.0.1:${port}`)} 2>/dev/null || true`, { requestId });
-    await run(`rm -f ${shellQuote(pidFile)}`, { requestId });
+    const fallbackPids = await findGostPidsByPort(port, { requestId });
+    for (const pid of fallbackPids) {
+        if (!candidatePids.includes(pid)) {
+            candidatePids.push(pid);
+        }
+    }
+
+    console.log(`${prefix} candidate pids for port=${port}: ${candidatePids.length ? candidatePids.join(",") : "<none>"}`);
+
+    for (const pid of candidatePids) {
+        if (handled.has(pid)) continue;
+        handled.add(pid);
+
+        if (!isProcessAlive(pid)) {
+            console.log(`${prefix} pid=${pid} already exited`);
+            continue;
+        }
+
+        try {
+            process.kill(pid, "SIGTERM");
+            console.log(`${prefix} sent SIGTERM pid=${pid}`);
+        } catch (err) {
+            console.warn(`${prefix} SIGTERM failed pid=${pid}: ${err.message}`);
+            continue;
+        }
+
+        const exited = await waitForExit(pid, 3000, 200);
+        if (!exited && isProcessAlive(pid)) {
+            console.warn(`${prefix} pid=${pid} did not exit after SIGTERM, sending SIGKILL`);
+            try {
+                process.kill(pid, "SIGKILL");
+            } catch (err) {
+                console.warn(`${prefix} SIGKILL failed pid=${pid}: ${err.message}`);
+            }
+            await waitForExit(pid, 1500, 100);
+        }
+
+        if (isProcessAlive(pid)) {
+            throw new Error(`failed to stop gost process pid=${pid} on port ${port}`);
+        }
+    }
+
+    await fs.rm(pidFile, { force: true });
     console.log(`${prefix} stop completed for port=${port}`);
 }
 
-function buildUpstream(proxy, options = {}) {
-    const { requestId } = options;
-    const prefix = logPrefix(requestId);
-
-    if (!proxy) {
-        console.log(`${prefix} buildUpstream: direct mode`);
-        return null;
-    }
-
-    const protocol = escapeConfigValue(proxy.protocol || "socks5");
-    const host = escapeConfigValue(proxy.host || "");
-    const upstreamPort = Number(proxy.port);
-    const username = escapeConfigValue(proxy.username || "");
-    const password = escapeConfigValue(proxy.password || "");
-
-    console.log(`${prefix} buildUpstream input=`, {
-        protocol,
-        host,
-        port: upstreamPort,
-        username,
-        hasPassword: Boolean(password)
-    });
-
-    if (!host || !Number.isInteger(upstreamPort) || upstreamPort <= 0) {
-        throw new Error("invalid proxy config");
-    }
+function buildUpstream(proxy) {
+    if (!proxy) return null;
 
     const authPart =
-        username || password
-            ? `${username}:${password}@`
+        proxy.username || proxy.password
+            ? `${proxy.username}:${proxy.password}@`
             : "";
 
-    const upstream = `${protocol}://${authPart}${host}:${upstreamPort}`;
-    const safeUpstream = `${protocol}://${username || password ? `${username}:***@` : ""}${host}:${upstreamPort}`;
-
-    console.log(`${prefix} buildUpstream output=${safeUpstream}`);
-    return upstream;
+    return `${proxy.protocol}://${authPart}${proxy.host}:${proxy.port}`;
 }
 
 async function startPort(port, proxy, options = {}) {
@@ -146,12 +287,18 @@ async function startPort(port, proxy, options = {}) {
     const prefix = logPrefix(requestId);
     const pidFile = pidFileOf(port);
     const logFile = logFileOf(port);
-    const upstream = buildUpstream(proxy, { requestId });
+    const normalizedProxy = normalizeProxy(proxy);
+    const upstream = buildUpstream(normalizedProxy);
+
+    const existingPids = await findGostPidsByPort(port, { requestId });
+    if (existingPids.length) {
+        throw new Error(`port ${port} still has running gost pid(s): ${existingPids.join(",")}`);
+    }
 
     const parts = [
         "export GOST_LOGGER_LEVEL=error;",
         "nohup gost",
-        `-L ${shellQuote(`socks5://127.0.0.1:${port}`)}`
+        `-L ${shellQuote(`socks5://127.0.0.1:${port}`)}`,
     ];
 
     if (upstream) {
@@ -161,15 +308,22 @@ async function startPort(port, proxy, options = {}) {
     parts.push(`>${shellQuote(logFile)} 2>&1 & echo $! > ${shellQuote(pidFile)}`);
 
     const cmd = parts.join(" ");
-    console.log(`${prefix} starting port=${port} pidFile=${pidFile} logFile=${logFile}`);
+    console.log(`${prefix} starting port=${port} mode=${normalizedProxy ? "proxy" : "direct"} logFile=${logFile}`);
+    console.log(`${prefix} desired upstream=`, maskProxy(normalizedProxy));
     await run(cmd, { requestId });
 
-    try {
-        const pid = (await fs.readFile(pidFile, "utf8")).trim();
-        console.log(`${prefix} started port=${port} pid=${pid || "<empty>"}`);
-    } catch (err) {
-        console.warn(`${prefix} started but failed to read pid file: ${err.message}`);
+    await sleep(300);
+    const pid = await readPidFromFile(port, { requestId });
+    if (!pid) {
+        throw new Error(`failed to read pid after start for port ${port}`);
     }
+
+    if (!isProcessAlive(pid)) {
+        throw new Error(`gost exited immediately after start pid=${pid} port=${port}`);
+    }
+
+    console.log(`${prefix} started port=${port} pid=${pid}`);
+    return pid;
 }
 
 async function readGostLogSnippet(port, options = {}) {
@@ -192,19 +346,12 @@ async function readGostLogSnippet(port, options = {}) {
     }
 }
 
-async function switchPort(port, proxy, options = {}) {
+async function verifyAndBuildResult(port, desiredState, options = {}) {
     const { requestId } = options;
     const prefix = logPrefix(requestId);
 
-    console.log(`${prefix} switchPort begin port=${port} mode=${proxy ? "proxy" : "direct"}`);
-    ensurePort(port);
-    await ensureDirs(requestId);
-
-    await stopPort(port, { requestId });
-    await startPort(port, proxy || null, { requestId });
-
-    console.log(`${prefix} waiting 1500ms before verification`);
-    await new Promise((r) => setTimeout(r, 1500));
+    console.log(`${prefix} waiting 800ms before verification`);
+    await sleep(800);
 
     try {
         const ip = await verifyPort(port, { requestId });
@@ -212,17 +359,18 @@ async function switchPort(port, proxy, options = {}) {
 
         return {
             port,
-            mode: proxy ? "proxy" : "direct",
+            mode: desiredState.mode,
             ip,
-            upstream: proxy
+            upstream: desiredState.proxy
                 ? {
-                    protocol: proxy.protocol || "socks5",
-                    host: proxy.host,
-                    port: proxy.port,
-                    username: proxy.username || ""
+                    protocol: desiredState.proxy.protocol,
+                    host: desiredState.proxy.host,
+                    port: desiredState.proxy.port,
+                    username: desiredState.proxy.username || "",
                 }
                 : null,
-            logFile: logFileOf(port)
+            logFile: logFileOf(port),
+            reused: false,
         };
     } catch (err) {
         const gostLog = await readGostLogSnippet(port, { requestId });
@@ -234,4 +382,44 @@ async function switchPort(port, proxy, options = {}) {
     }
 }
 
-module.exports = { switchPort, stopPort, startPort, logFileOf };
+async function switchPort(port, proxy, options = {}) {
+    const { requestId } = options;
+    const prefix = logPrefix(requestId);
+
+    ensurePort(port);
+    await ensureDirs(requestId);
+
+    const desiredState = getDesiredState(port, proxy);
+    const currentState = await readState(port);
+    const currentPid = await readPidFromFile(port, { requestId });
+    const currentAlive = Boolean(currentPid && isProcessAlive(currentPid));
+
+    console.log(`${prefix} switchPort begin port=${port} desired=`, {
+        mode: desiredState.mode,
+        proxy: maskProxy(desiredState.proxy),
+    });
+    console.log(`${prefix} current state=`, currentState
+        ? { mode: currentState.mode, proxy: maskProxy(currentState.proxy), updatedAt: currentState.updatedAt }
+        : null);
+    console.log(`${prefix} current pid=${currentPid || "<none>"} alive=${currentAlive}`);
+
+    if (sameState(currentState, desiredState) && currentAlive) {
+        console.log(`${prefix} desired state matches current state, reusing existing process`);
+        const result = await verifyAndBuildResult(port, desiredState, { requestId });
+        result.reused = true;
+        return result;
+    }
+
+    await stopPort(port, { requestId });
+    await startPort(port, desiredState.proxy, { requestId });
+    await writeState(port, desiredState);
+
+    try {
+        return await verifyAndBuildResult(port, desiredState, { requestId });
+    } catch (err) {
+        await removeState(port).catch(() => undefined);
+        throw err;
+    }
+}
+
+module.exports = { switchPort, stopPort, startPort, logFileOf, stateFileOf };
