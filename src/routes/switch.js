@@ -7,6 +7,7 @@ router.post("/", async (req, res) => {
     try {
         const { slot, proxy } = req.body;
 
+        console.log(slot, proxy)
         if (slot === undefined || slot === null || slot === "") {
             return res.status(400).json({ ok: false, error: "slot is required" });
         }
