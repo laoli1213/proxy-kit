@@ -1,7 +1,6 @@
 const fs = require("fs").promises;
 const path = require("path");
 const { exec } = require("child_process");
-const { verifyPort } = require("./verify");
 
 const PID_DIR = "/var/run/gost-slots";
 const LOG_DIR = "/tmp/gost-slots";
@@ -326,62 +325,6 @@ async function startPort(port, proxy, options = {}) {
     return pid;
 }
 
-async function readGostLogSnippet(port, options = {}) {
-    const { requestId } = options;
-    const prefix = logPrefix(requestId);
-    const logFile = logFileOf(port);
-
-    try {
-        const content = await fs.readFile(logFile, "utf8");
-        const snippet = summarizeText(content, 1200);
-        if (snippet) {
-            console.log(`${prefix} gost log snippet (${logFile}): ${snippet}`);
-        } else {
-            console.log(`${prefix} gost log is empty (${logFile})`);
-        }
-        return snippet;
-    } catch (err) {
-        console.warn(`${prefix} failed to read gost log ${logFile}: ${err.message}`);
-        return "";
-    }
-}
-
-async function verifyAndBuildResult(port, desiredState, options = {}) {
-    const { requestId } = options;
-    const prefix = logPrefix(requestId);
-
-    console.log(`${prefix} waiting 800ms before verification`);
-    await sleep(800);
-
-    try {
-        const ip = await verifyPort(port, { requestId });
-        console.log(`${prefix} verification success ip=${ip}`);
-
-        return {
-            port,
-            mode: desiredState.mode,
-            ip,
-            upstream: desiredState.proxy
-                ? {
-                    protocol: desiredState.proxy.protocol,
-                    host: desiredState.proxy.host,
-                    port: desiredState.proxy.port,
-                    username: desiredState.proxy.username || "",
-                }
-                : null,
-            logFile: logFileOf(port),
-            reused: false,
-        };
-    } catch (err) {
-        const gostLog = await readGostLogSnippet(port, { requestId });
-        const enrichedMessage = gostLog
-            ? `${err.message} | gostLog=${gostLog}`
-            : err.message;
-        console.error(`${prefix} verification failed: ${enrichedMessage}`);
-        throw new Error(enrichedMessage);
-    }
-}
-
 async function switchPort(port, proxy, options = {}) {
     const { requestId } = options;
     const prefix = logPrefix(requestId);
@@ -405,21 +348,40 @@ async function switchPort(port, proxy, options = {}) {
 
     if (sameState(currentState, desiredState) && currentAlive) {
         console.log(`${prefix} desired state matches current state, reusing existing process`);
-        const result = await verifyAndBuildResult(port, desiredState, { requestId });
-        result.reused = true;
-        return result;
+        return {
+            port,
+            mode: desiredState.mode,
+            upstream: desiredState.proxy
+                ? {
+                    protocol: desiredState.proxy.protocol,
+                    host: desiredState.proxy.host,
+                    port: desiredState.proxy.port,
+                    username: desiredState.proxy.username || "",
+                }
+                : null,
+            logFile: logFileOf(port),
+            reused: true,
+        };
     }
 
     await stopPort(port, { requestId });
     await startPort(port, desiredState.proxy, { requestId });
     await writeState(port, desiredState);
 
-    try {
-        return await verifyAndBuildResult(port, desiredState, { requestId });
-    } catch (err) {
-        await removeState(port).catch(() => undefined);
-        throw err;
-    }
+    return {
+        port,
+        mode: desiredState.mode,
+        upstream: desiredState.proxy
+            ? {
+                protocol: desiredState.proxy.protocol,
+                host: desiredState.proxy.host,
+                port: desiredState.proxy.port,
+                username: desiredState.proxy.username || "",
+            }
+            : null,
+        logFile: logFileOf(port),
+        reused: false,
+    };
 }
 
 module.exports = { switchPort, stopPort, startPort, logFileOf, stateFileOf };
